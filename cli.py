@@ -197,9 +197,17 @@ def main(argv=None):
         print()
         sys.exit(1)
 
-    # 合并去重
-    result = merge_and_dedupe(authored, reviewed)
+    # 合并去重 PR
+    prs = merge_and_dedupe(authored, reviewed)
 
+    # 采集 issues
+    issues = search_issues(args.user, args.org, args.since, args.until, token)
+    if isinstance(issues, dict) and "error" in issues:
+        json.dump(issues, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        sys.exit(1)
+
+    result = {"prs": prs, "issues": issues}
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     print()
 

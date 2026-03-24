@@ -141,7 +141,7 @@ def test_merge_and_dedupe():
 @patch("cli.requests.get")
 def test_main_end_to_end(mock_get, capsys):
     """完整 main 调用，输出 JSON"""
-    mock_get.return_value = _mock_response(200, {
+    pr_resp = _mock_response(200, {
         "total_count": 1,
         "items": [{
             "number": 42,
@@ -153,13 +153,17 @@ def test_main_end_to_end(mock_get, capsys):
             "repository_url": "https://api.github.com/repos/matrixorigin/matrixflow",
         }]
     })
+    empty_issue_resp = _mock_response(200, {"total_count": 0, "items": []})
+    mock_get.side_effect = [pr_resp, pr_resp, empty_issue_resp]
     cli.main(["--user", "aqqi666", "--org", "matrixorigin",
               "--since", "2026-03-17", "--until", "2026-03-21", "--token", "fake"])
     captured = capsys.readouterr()
     data = json.loads(captured.out)
-    assert len(data) >= 1
-    assert data[0]["pr_number"] == 42
-    assert data[0]["state"] == "merged"
+    assert "prs" in data
+    assert "issues" in data
+    assert len(data["prs"]) >= 1
+    assert data["prs"][0]["pr_number"] == 42
+    assert data["prs"][0]["state"] == "merged"
 
 @patch("cli.requests.get")
 def test_main_error_output(mock_get, capsys):
@@ -175,13 +179,55 @@ def test_main_error_output(mock_get, capsys):
 
 @patch("cli.requests.get")
 def test_main_empty_result(mock_get, capsys):
-    """无 PR 时输出空数组，退出码 0"""
-    mock_get.return_value = _mock_response(200, {"total_count": 0, "items": []})
+    """无 PR 和 issue 时输出空字典结构，退出码 0"""
+    empty_resp = _mock_response(200, {"total_count": 0, "items": []})
+    mock_get.side_effect = [empty_resp, empty_resp, empty_resp]
     cli.main(["--user", "x", "--org", "y",
               "--since", "2026-03-17", "--until", "2026-03-21", "--token", "fake"])
     captured = capsys.readouterr()
     data = json.loads(captured.out)
-    assert data == []
+    assert data == {"prs": [], "issues": []}
+
+@patch("cli.requests.get")
+def test_main_with_issues(mock_get, capsys):
+    """main 输出包含 prs 和 issues 两个键"""
+    pr_response = _mock_response(200, {
+        "total_count": 1,
+        "items": [{
+            "number": 42,
+            "title": "fix: something",
+            "state": "closed",
+            "created_at": "2026-03-17T08:00:00Z",
+            "pull_request": {"merged_at": "2026-03-18T10:00:00Z"},
+            "html_url": "https://github.com/org/repo/pull/42",
+            "repository_url": "https://api.github.com/repos/org/repo",
+        }]
+    })
+    issue_response = _mock_response(200, {
+        "total_count": 1,
+        "items": [{
+            "number": 301,
+            "title": "Bug: timeout",
+            "state": "open",
+            "created_at": "2026-03-17T10:00:00Z",
+            "updated_at": "2026-03-19T15:00:00Z",
+            "html_url": "https://github.com/org/repo/issues/301",
+            "repository_url": "https://api.github.com/repos/org/repo",
+            "labels": [{"name": "bug"}],
+            "assignees": [{"login": "testuser"}],
+        }]
+    })
+    # search_prs is called twice (author + reviewed-by), then search_issues once
+    mock_get.side_effect = [pr_response, pr_response, issue_response]
+    cli.main(["--user", "testuser", "--org", "org",
+              "--since", "2026-03-17", "--until", "2026-03-21", "--token", "fake"])
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert "prs" in data
+    assert "issues" in data
+    assert len(data["prs"]) >= 1
+    assert len(data["issues"]) == 1
+    assert data["issues"][0]["issue_number"] == 301
 
 @patch("cli.requests.get")
 def test_search_issues_basic(mock_get):
