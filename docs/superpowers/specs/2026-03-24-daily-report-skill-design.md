@@ -75,9 +75,27 @@ daily-report/
 ]
 ```
 
-**实现**：用 `subprocess` 调用本机 `gh api` 或直接用 `urllib` 请求 GitHub REST API。优先 `urllib`（标准库，无外部依赖，且中心化部署时不依赖 `gh` CLI）。
+**实现**：用 `requests` 请求 GitHub REST API（中心化部署时不依赖 `gh` CLI）。
 
-**依赖**：仅标准库（`urllib`、`json`、`argparse`、`datetime`）。`requirements.txt` 为空或不需要。
+**分页与限流**：
+- GitHub Search API 单次最多返回 100 条，需分页遍历（`per_page=100` + `page`）
+- 认证用户速率限制 30 次/分钟，遇到 429 时指数退避重试（最多 3 次）
+- 多用户并发场景下共享同一 token 的 rate limit，cli.py 在响应头中读取 `X-RateLimit-Remaining`，不足时等待 `X-RateLimit-Reset`
+
+**时区处理**：
+- `--since` 和 `--until` 为本地日期（如 `2026-03-17`）
+- 查询时 `--until` 自动 +1 天转为左闭右开区间，确保包含当天所有 PR
+- GitHub API 使用 UTC，查询时在日期后附加 `T00:00:00+08:00` 转换为北京时间
+
+**错误处理**：
+- GitHub API 不可达：输出 JSON `{"error": "github_unreachable", "message": "..."}` 并退出码 1
+- Token 过期/权限不足（401/403）：输出 `{"error": "auth_failed", "message": "..."}`
+- 无结果：输出空数组 `[]`，退出码 0
+
+**依赖**：`requests`。
+
+**已知限制**：
+- `reviewed-by:{user}` 筛选的是用户提交过 review 的 PR，但 `updated:` 过滤的是 PR 更新时间而非 review 时间。如果用户在本周 review 了一个很久以前创建且未更新的 PR，可能会漏掉。这在实际使用中概率较低（review 动作本身会更新 PR），但需要用户知晓。
 
 ### 2. SKILL.md — NanoClaw Container Skill
 
@@ -95,11 +113,13 @@ daily-report/
 
 - 首次使用时询问 GitHub 用户名，记到 group 的 CLAUDE.md 记忆中
 - 后续自动读取，不再询问
+- 局限：无法自动验证用户输入的 GitHub 用户名是否属于本人，依赖用户诚实输入。后续可考虑维护企业微信 ID → GitHub 用户名的映射表
 
 #### 数据采集
 
-- 调用 `python cli.py --user {username} --org matrixorigin --since {since} --until {until}`
+- 调用 `python cli.py --user {username} --org matrixorigin --since {since} --until {until} --token {token}`
 - 解析 JSON 输出
+- 如果返回 `error` 字段，向用户说明原因（网络问题 / token 过期等），不编造数据
 
 #### AI 总结
 
@@ -129,7 +149,7 @@ daily-report/
 - **GitHub App**（推荐）：安装在 matrixorigin 组织上，自动获得仓库读权限，token 自动轮转
 - **Service Account PAT**：创建 bot 账号，生成 PAT，需手动续期
 
-Token 作为环境变量 `GITHUB_TOKEN` 注入 NanoClaw 容器。
+Token 由 NanoClaw host 进程持有，cli.py 通过 `--token` 参数接收。**不注入到用户容器的环境变量中**，避免用户通过对话让 agent 读取 `env` 泄露组织级 token。agent 调用 cli.py 时由 SKILL.md 指令拼接 `--token` 参数，token 值从 host 侧的配置文件读取。
 
 ### 4. 企业微信接入
 
