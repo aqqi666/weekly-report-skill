@@ -56,6 +56,7 @@ def test_search_prs_basic(mock_get):
     assert len(results) == 1
     assert results[0]["pr_number"] == 100
     assert results[0]["repo"] == "repo"
+    assert results[0]["body"] == ""  # body 为 None 时应为空字符串
 
 @patch("cli.requests.get")
 def test_search_prs_auth_error(mock_get):
@@ -252,3 +253,5 @@ def test_search_issues_basic(mock_get):
     assert results[0]["repo"] == "repo"
     assert results[0]["labels"] == ["bug"]
     assert results[0]["type"] == "issue"
+    assert results[0]["body"] == ""
+    assert results[0]["comments"] == 0

@@ -78,6 +78,7 @@ def search_prs(user, org, since, until, token, query_prefix="author"):
                 "created_at": item["created_at"][:10],
                 "merged_at": (item.get("pull_request", {}).get("merged_at") or "")[:10] or None,
                 "url": item["html_url"],
+                "body": (item.get("body") or "")[:500],
             })
 
         if len(items) < 100:
@@ -146,6 +147,8 @@ def search_issues(user, org, since, until, token):
                 "labels": [l["name"] for l in item.get("labels", [])],
                 "assignees": [a["login"] for a in item.get("assignees", [])],
                 "url": item["html_url"],
+                "body": (item.get("body") or "")[:500],
+                "comments": item.get("comments", 0),
             })
 
         if len(items) < 100:
