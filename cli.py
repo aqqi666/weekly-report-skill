@@ -3,8 +3,10 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import requests
@@ -84,7 +86,7 @@ def search_prs(user, scope, since, until, token, query_prefix="author"):
                 "created_at": item["created_at"][:10],
                 "merged_at": (item.get("pull_request", {}).get("merged_at") or "")[:10] or None,
                 "url": item["html_url"],
-                "body": (item.get("body") or "")[:500],
+                "body": clean_text(item.get("body")),
             })
 
         if len(items) < 100:
@@ -157,8 +159,8 @@ def search_issues(user, scope, since, until, token):
                 "labels": [l["name"] for l in item.get("labels", [])],
                 "assignees": [a["login"] for a in item.get("assignees", [])],
                 "url": item["html_url"],
-                "body": (item.get("body") or "")[:500],
-                "comments": item.get("comments", 0),
+                "body": clean_text(item.get("body")),
+                "comments_count": item.get("comments", 0),
             })
 
         if len(items) < 100:
@@ -221,6 +223,98 @@ def auth_poll(device_code):
     username = user_resp.json().get("login", "") if user_resp.status_code == 200 else ""
 
     return {"token": token, "username": username}
+
+
+MAX_WORKERS = 10  # 并行请求数
+
+# 匹配 HTML img 标签和 markdown 图片语法
+_IMG_PATTERNS = re.compile(
+    r'<img[^>]*>|!\[[^\]]*\]\([^)]+\)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def clean_text(text):
+    """去掉图片标签和多余空行。"""
+    if not text:
+        return ""
+    text = _IMG_PATTERNS.sub("", text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def api_get(url, token):
+    """通用 GitHub API GET 请求，带重试。"""
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429 or (resp.status_code == 403 and "rate limit" in resp.text.lower()):
+                reset_at = int(resp.headers.get("X-RateLimit-Reset", "0"))
+                time.sleep(max(1, min(reset_at - int(time.time()), 30)))
+            else:
+                return None
+        except Exception:
+            pass
+    return None
+
+
+def fetch_pr_details(pr, token):
+    """并行获取单个 PR 的详情、reviews、comments。"""
+    repo = pr["repo"]
+    number = pr["pr_number"]
+
+    # PR 详情（additions/deletions）
+    detail = api_get(f"{GITHUB_API}/repos/{repo}/pulls/{number}", token)
+    if detail:
+        pr["additions"] = detail.get("additions", 0)
+        pr["deletions"] = detail.get("deletions", 0)
+        pr["changed_files"] = detail.get("changed_files", 0)
+
+    # PR reviews
+    reviews_data = api_get(f"{GITHUB_API}/repos/{repo}/pulls/{number}/reviews", token)
+    if reviews_data:
+        pr["reviews"] = [
+            {"user": r["user"]["login"], "state": r["state"], "body": clean_text(r.get("body"))}
+            for r in reviews_data
+        ]
+
+    # PR comments（review comments）
+    comments_data = api_get(f"{GITHUB_API}/repos/{repo}/pulls/{number}/comments", token)
+    if comments_data:
+        pr["review_comments"] = [
+            {"user": c["user"]["login"], "body": clean_text(c["body"]), "created_at": c["created_at"][:10]}
+            for c in comments_data
+        ]
+
+    # Issue comments（PR 下的普通讨论）
+    issue_comments = api_get(f"{GITHUB_API}/repos/{repo}/issues/{number}/comments", token)
+    if issue_comments:
+        pr["comments"] = [
+            {"user": c["user"]["login"], "body": clean_text(c["body"]), "created_at": c["created_at"][:10]}
+            for c in issue_comments
+        ]
+
+    return pr
+
+
+def fetch_issue_comments(issue, token):
+    """并行获取单个 Issue 的 comments。"""
+    if issue.get("comments_count", 0) == 0:
+        return issue
+
+    repo = issue["repo"]
+    number = issue["issue_number"]
+    comments_data = api_get(f"{GITHUB_API}/repos/{repo}/issues/{number}/comments", token)
+    if comments_data:
+        issue["comments_detail"] = [
+            {"user": c["user"]["login"], "body": clean_text(c["body"]), "created_at": c["created_at"][:10]}
+            for c in comments_data
+        ]
+
+    return issue
 
 
 def merge_and_dedupe(authored, reviewed):
@@ -295,56 +389,34 @@ def main(argv=None):
         print()
         sys.exit(1)
 
+    # 第一阶段：并行搜索所有 scope 的 PR 和 Issue
     all_authored = []
     all_reviewed = []
     all_issues = []
 
-    for scope in scopes:
-        # 采集 authored PR
+    def search_scope(scope):
         authored = search_prs(args.user, scope, args.since, args.until, token, query_prefix="author")
-        if isinstance(authored, dict) and "error" in authored:
-            json.dump(authored, sys.stdout, ensure_ascii=False, indent=2)
-            print()
-            sys.exit(1)
-        all_authored.extend(authored)
-
-        # 采集 reviewed PR
         reviewed = search_prs(args.user, scope, args.since, args.until, token, query_prefix="reviewed-by")
-        if isinstance(reviewed, dict) and "error" in reviewed:
-            json.dump(reviewed, sys.stdout, ensure_ascii=False, indent=2)
-            print()
-            sys.exit(1)
-        all_reviewed.extend(reviewed)
-
-        # 采集 issues
         issues = search_issues(args.user, scope, args.since, args.until, token)
-        if isinstance(issues, dict) and "error" in issues:
-            json.dump(issues, sys.stdout, ensure_ascii=False, indent=2)
-            print()
-            sys.exit(1)
-        all_issues.extend(issues)
+        return authored, reviewed, issues
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(search_scope, s): s for s in scopes}
+        for future in as_completed(futures):
+            authored, reviewed, issues = future.result()
+            for result in (authored, reviewed, issues):
+                if isinstance(result, dict) and "error" in result:
+                    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+                    print()
+                    sys.exit(1)
+            all_authored.extend(authored)
+            all_reviewed.extend(reviewed)
+            all_issues.extend(issues)
 
     # 合并去重 PR
     prs = merge_and_dedupe(all_authored, all_reviewed)
 
-    # 为已合并的 PR 补充 additions/deletions（需要额外 API 调用）
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-    for pr in prs:
-        if pr["state"] == "merged":
-            try:
-                resp = requests.get(
-                    f"{GITHUB_API}/repos/{pr['repo']}/pulls/{pr['pr_number']}",
-                    headers=headers,
-                )
-                if resp.status_code == 200:
-                    detail = resp.json()
-                    pr["additions"] = detail.get("additions", 0)
-                    pr["deletions"] = detail.get("deletions", 0)
-                    pr["changed_files"] = detail.get("changed_files", 0)
-            except Exception:
-                pass
-
-    # Issue 去重（跨 scope 可能重复）
+    # Issue 去重
     seen_issues = {}
     for issue in all_issues:
         key = (issue["repo"], issue["issue_number"])
@@ -352,8 +424,21 @@ def main(argv=None):
             seen_issues[key] = issue
     unique_issues = sorted(seen_issues.values(), key=lambda x: x["updated_at"], reverse=True)
 
-    result = {"prs": prs, "issues": unique_issues}
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+    # 第二阶段：并行获取 PR 详情（additions/deletions + reviews + comments）和 Issue comments
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        pr_futures = [pool.submit(fetch_pr_details, pr, token) for pr in prs]
+        issue_futures = [pool.submit(fetch_issue_comments, issue, token) for issue in unique_issues]
+        for f in as_completed(pr_futures + issue_futures):
+            f.result()  # 结果已原地更新到 pr/issue 对象
+
+    # 输出结果到文件，避免 stdout 数据量过大
+    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output.json")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump({"prs": prs, "issues": unique_issues}, f, ensure_ascii=False, indent=2)
+
+    # stdout 输出简要摘要，告诉 agent 去读文件
+    summary = {"status": "ok", "output_file": output_path, "pr_count": len(prs), "issue_count": len(unique_issues)}
+    json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
     print()
 
 

@@ -83,17 +83,20 @@ python ${CLAUDE_SKILL_DIR}/cli.py fetch --user {github_username} --org matrixori
 
 根据用户配置的项目范围，拼接 `--org` 和 `--repo` 参数。`matrixorigin` 始终作为第一个 `--org`。
 
-其中 `{token}` 从 host 侧配置读取（由 NanoClaw 框架注入），不要从容器环境变量中读取。
+其中 `{token}` 从 CLAUDE.md 的周报配置中读取。
 
-解析 stdout 的 JSON 输出。输出格式为：
+命令执行完后，stdout 输出一个摘要 JSON：
 ```json
-{
-  "prs": [...],
-  "issues": [...]
-}
+{"status": "ok", "output_file": "/path/to/output.json", "pr_count": 6, "issue_count": 9}
 ```
 
-如果返回的 JSON 包含 `error` 字段，向用户说明原因（如"GitHub API 暂时不可用，请稍后再试"），**不要编造数据**。
+完整数据保存在 `output_file` 指向的文件中，读取该文件获取全量数据（PR 详情、reviews、comments、Issue comments 等）。
+
+如果返回的 JSON 包含 `error` 字段：
+- `auth_failed` → GitHub token 已过期，引导用户重新授权（回到步骤 1.1）
+- 其他错误 → 向用户说明原因（如"GitHub API 暂时不可用，请稍后再试"）
+
+**不要编造数据。**
 
 ## 4. 生成周报
 
