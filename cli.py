@@ -1,4 +1,4 @@
-"""GitHub PR 数据采集 CLI，输出结构化 JSON。"""
+"""GitHub 数据采集 CLI，支持 Device Flow 授权和 PR/Issue 数据采集。"""
 
 import argparse
 import json
@@ -11,12 +11,16 @@ import requests
 
 
 GITHUB_API = "https://api.github.com"
+GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
+GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
+CLIENT_ID = "Iv23li6VhESk1QWgod7e"
 RATE_LIMIT_BUFFER = 5  # 剩余次数低于此值时主动等待
 
 
-def search_prs(user, org, since, until, token, query_prefix="author"):
+def search_prs(user, scope, since, until, token, query_prefix="author"):
     """搜索 GitHub PR，返回列表或错误字典。
 
+    scope: 搜索范围，如 "org:matrixorigin" 或 "repo:user/repo-name"
     query_prefix: "author" 或 "reviewed-by"
     token: 必需，调用者负责传入
     """
@@ -26,7 +30,7 @@ def search_prs(user, org, since, until, token, query_prefix="author"):
     # until +1 天，转为左闭右开区间
     until_exclusive = (datetime.strptime(until, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    query = f"{query_prefix}:{user} org:{org} type:pr updated:{since}T00:00:00+08:00..{until_exclusive}T00:00:00+08:00"
+    query = f"{query_prefix}:{user} {scope} type:pr updated:{since}T00:00:00+08:00..{until_exclusive}T00:00:00+08:00"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
 
     all_items = []
@@ -68,9 +72,11 @@ def search_prs(user, org, since, until, token, query_prefix="author"):
 
         items = body.get("items", [])
         for item in items:
-            repo_name = item["repository_url"].rsplit("/", 1)[-1]
+            # 从 repository_url 提取 owner/repo 全路径
+            repo_url_parts = item["repository_url"].rsplit("/", 2)
+            full_repo = f"{repo_url_parts[-2]}/{repo_url_parts[-1]}"
             all_items.append({
-                "repo": repo_name,
+                "repo": full_repo,
                 "pr_number": item["number"],
                 "title": item["title"],
                 "state": "merged" if item.get("pull_request", {}).get("merged_at") else item["state"],
@@ -88,14 +94,17 @@ def search_prs(user, org, since, until, token, query_prefix="author"):
     return all_items
 
 
-def search_issues(user, org, since, until, token):
-    """搜索用户参与的 issue（创建、评论、被 assign、被 mention），返回列表或错误字典。"""
+def search_issues(user, scope, since, until, token):
+    """搜索用户参与的 issue（创建、评论、被 assign、被 mention），返回列表或错误字典。
+
+    scope: 搜索范围，如 "org:matrixorigin" 或 "repo:user/repo-name"
+    """
     if not token:
         return {"error": "auth_failed", "message": "未提供 GitHub token"}
 
     until_exclusive = (datetime.strptime(until, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    query = f"involves:{user} org:{org} type:issue updated:{since}T00:00:00+08:00..{until_exclusive}T00:00:00+08:00"
+    query = f"involves:{user} {scope} type:issue updated:{since}T00:00:00+08:00..{until_exclusive}T00:00:00+08:00"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
 
     all_items = []
@@ -135,10 +144,11 @@ def search_issues(user, org, since, until, token):
 
         items = body.get("items", [])
         for item in items:
-            repo_name = item["repository_url"].rsplit("/", 1)[-1]
+            repo_url_parts = item["repository_url"].rsplit("/", 2)
+            full_repo = f"{repo_url_parts[-2]}/{repo_url_parts[-1]}"
             all_items.append({
                 "type": "issue",
-                "repo": repo_name,
+                "repo": full_repo,
                 "issue_number": item["number"],
                 "title": item["title"],
                 "state": item["state"],
@@ -158,6 +168,61 @@ def search_issues(user, org, since, until, token):
     return all_items
 
 
+def auth_start():
+    """请求 GitHub Device Code，立即返回 user_code 和 device_code。"""
+    resp = requests.post(
+        GITHUB_DEVICE_CODE_URL,
+        data={"client_id": CLIENT_ID, "scope": "repo read:org"},
+        headers={"Accept": "application/json"},
+    )
+    if resp.status_code != 200:
+        return {"error": "device_flow_failed", "message": f"请求 device code 失败: {resp.status_code}"}
+
+    data = resp.json()
+    return {
+        "device_code": data["device_code"],
+        "user_code": data["user_code"],
+        "verification_uri": data["verification_uri"],
+        "expires_in": data.get("expires_in", 900),
+    }
+
+
+def auth_poll(device_code):
+    """用 device_code 检查用户是否已授权，立即返回结果。"""
+    resp = requests.post(
+        GITHUB_ACCESS_TOKEN_URL,
+        data={"client_id": CLIENT_ID, "device_code": device_code, "grant_type": "urn:ietf:params:oauth:grant-type:device_code"},
+        headers={"Accept": "application/json"},
+    )
+    body = resp.json()
+    error = body.get("error")
+
+    if error == "authorization_pending":
+        return {"status": "pending", "message": "用户尚未完成授权"}
+    elif error == "slow_down":
+        return {"status": "pending", "message": "请稍后再试"}
+    elif error == "expired_token":
+        return {"error": "expired", "message": "授权已过期，请重新运行 auth start"}
+    elif error == "access_denied":
+        return {"error": "denied", "message": "用户拒绝了授权"}
+    elif error:
+        return {"error": error, "message": body.get("error_description", error)}
+
+    # 授权成功
+    token = body.get("access_token")
+    if not token:
+        return {"error": "no_token", "message": "授权响应中没有 access_token"}
+
+    # 用 token 获取用户名
+    user_resp = requests.get(
+        f"{GITHUB_API}/user",
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"},
+    )
+    username = user_resp.json().get("login", "") if user_resp.status_code == 200 else ""
+
+    return {"token": token, "username": username}
+
+
 def merge_and_dedupe(authored, reviewed):
     """合并 authored 和 reviewed 的 PR 列表，按 repo+pr_number 去重，合并角色。"""
     index = {}
@@ -173,35 +238,94 @@ def merge_and_dedupe(authored, reviewed):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="采集 GitHub PR 数据，输出 JSON")
-    parser.add_argument("--user", required=True, help="GitHub 用户名")
-    parser.add_argument("--org", required=True, help="GitHub 组织名")
-    parser.add_argument("--since", required=True, help="开始日期（含），格式 YYYY-MM-DD")
-    parser.add_argument("--until", required=True, help="结束日期（含），格式 YYYY-MM-DD")
-    parser.add_argument("--token", default=None, help="GitHub token，默认读取 GITHUB_TOKEN 环境变量")
-    return parser.parse_args(argv)
+    parser = argparse.ArgumentParser(description="GitHub 数据采集 CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # auth start 子命令
+    auth_parser = subparsers.add_parser("auth-start", help="请求 GitHub Device Code（立即返回）")
+
+    # auth poll 子命令
+    poll_parser = subparsers.add_parser("auth-poll", help="检查用户是否已完成授权（立即返回）")
+    poll_parser.add_argument("--device-code", required=True, help="auth-start 返回的 device_code")
+
+    # fetch 子命令（默认行为，兼容旧调用方式）
+    fetch_parser = subparsers.add_parser("fetch", help="采集 PR 和 Issue 数据")
+    fetch_parser.add_argument("--user", required=True, help="GitHub 用户名")
+    fetch_parser.add_argument("--org", action="append", default=[], help="GitHub 组织名，可多次指定")
+    fetch_parser.add_argument("--repo", action="append", default=[], help="额外的仓库（owner/repo 格式），可多次指定")
+    fetch_parser.add_argument("--since", required=True, help="开始日期（含），格式 YYYY-MM-DD")
+    fetch_parser.add_argument("--until", required=True, help="结束日期（含），格式 YYYY-MM-DD")
+    fetch_parser.add_argument("--token", default=None, help="GitHub token，默认读取 GITHUB_TOKEN 环境变量")
+
+    # 向后兼容：没有子命令时自动当作 fetch
+    raw = argv if argv is not None else sys.argv[1:]
+    if raw and raw[0] not in ("auth-start", "auth-poll", "fetch"):
+        raw = ["fetch"] + list(raw)
+
+    args = parser.parse_args(raw)
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
+
+    if args.command == "auth-start":
+        result = auth_start()
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        sys.exit(1 if "error" in result else 0)
+
+    if args.command == "auth-poll":
+        result = auth_poll(args.device_code)
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        sys.exit(1 if "error" in result else 0)
+
+    # fetch 命令
     token = args.token or os.environ.get("GITHUB_TOKEN")
 
-    # 采集 authored PR
-    authored = search_prs(args.user, args.org, args.since, args.until, token, query_prefix="author")
-    if isinstance(authored, dict) and "error" in authored:
-        json.dump(authored, sys.stdout, ensure_ascii=False, indent=2)
+    # 构建搜索范围列表
+    scopes = [f"org:{org}" for org in args.org] + [f"repo:{repo}" for repo in args.repo]
+    if not scopes:
+        json.dump({"error": "no_scope", "message": "至少需要指定一个 --org 或 --repo"}, sys.stdout, ensure_ascii=False, indent=2)
         print()
         sys.exit(1)
 
-    # 采集 reviewed PR
-    reviewed = search_prs(args.user, args.org, args.since, args.until, token, query_prefix="reviewed-by")
-    if isinstance(reviewed, dict) and "error" in reviewed:
-        json.dump(reviewed, sys.stdout, ensure_ascii=False, indent=2)
-        print()
-        sys.exit(1)
+    all_authored = []
+    all_reviewed = []
+    all_issues = []
+
+    for scope in scopes:
+        # 采集 authored PR
+        authored = search_prs(args.user, scope, args.since, args.until, token, query_prefix="author")
+        if isinstance(authored, dict) and "error" in authored:
+            json.dump(authored, sys.stdout, ensure_ascii=False, indent=2)
+            print()
+            sys.exit(1)
+        all_authored.extend(authored)
+
+        # 采集 reviewed PR
+        reviewed = search_prs(args.user, scope, args.since, args.until, token, query_prefix="reviewed-by")
+        if isinstance(reviewed, dict) and "error" in reviewed:
+            json.dump(reviewed, sys.stdout, ensure_ascii=False, indent=2)
+            print()
+            sys.exit(1)
+        all_reviewed.extend(reviewed)
+
+        # 采集 issues
+        issues = search_issues(args.user, scope, args.since, args.until, token)
+        if isinstance(issues, dict) and "error" in issues:
+            json.dump(issues, sys.stdout, ensure_ascii=False, indent=2)
+            print()
+            sys.exit(1)
+        all_issues.extend(issues)
 
     # 合并去重 PR
-    prs = merge_and_dedupe(authored, reviewed)
+    prs = merge_and_dedupe(all_authored, all_reviewed)
 
     # 为已合并的 PR 补充 additions/deletions（需要额外 API 调用）
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
@@ -209,7 +333,7 @@ def main(argv=None):
         if pr["state"] == "merged":
             try:
                 resp = requests.get(
-                    f"{GITHUB_API}/repos/{args.org}/{pr['repo']}/pulls/{pr['pr_number']}",
+                    f"{GITHUB_API}/repos/{pr['repo']}/pulls/{pr['pr_number']}",
                     headers=headers,
                 )
                 if resp.status_code == 200:
@@ -220,14 +344,15 @@ def main(argv=None):
             except Exception:
                 pass
 
-    # 采集 issues
-    issues = search_issues(args.user, args.org, args.since, args.until, token)
-    if isinstance(issues, dict) and "error" in issues:
-        json.dump(issues, sys.stdout, ensure_ascii=False, indent=2)
-        print()
-        sys.exit(1)
+    # Issue 去重（跨 scope 可能重复）
+    seen_issues = {}
+    for issue in all_issues:
+        key = (issue["repo"], issue["issue_number"])
+        if key not in seen_issues:
+            seen_issues[key] = issue
+    unique_issues = sorted(seen_issues.values(), key=lambda x: x["updated_at"], reverse=True)
 
-    result = {"prs": prs, "issues": issues}
+    result = {"prs": prs, "issues": unique_issues}
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     print()
 
