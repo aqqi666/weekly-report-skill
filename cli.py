@@ -172,15 +172,22 @@ def search_issues(user, scope, since, until, token):
 
 def auth_start():
     """请求 GitHub Device Code，立即返回 user_code 和 device_code。"""
-    resp = requests.post(
-        GITHUB_DEVICE_CODE_URL,
-        data={"client_id": CLIENT_ID, "scope": "repo read:org"},
-        headers={"Accept": "application/json"},
-    )
+    try:
+        resp = requests.post(
+            GITHUB_DEVICE_CODE_URL,
+            data={"client_id": CLIENT_ID, "scope": "repo read:org"},
+            headers={"Accept": "application/json"},
+        )
+    except Exception as e:
+        return {"error": "network_error", "message": f"请求失败: {e}"}
+
     if resp.status_code != 200:
         return {"error": "device_flow_failed", "message": f"请求 device code 失败: {resp.status_code}"}
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception:
+        return {"error": "invalid_response", "message": f"GitHub 返回了非 JSON 响应（HTTP {resp.status_code}），请稍后重试"}
     return {
         "device_code": data["device_code"],
         "user_code": data["user_code"],
@@ -191,12 +198,23 @@ def auth_start():
 
 def auth_poll(device_code):
     """用 device_code 检查用户是否已授权，立即返回结果。"""
-    resp = requests.post(
-        GITHUB_ACCESS_TOKEN_URL,
-        data={"client_id": CLIENT_ID, "device_code": device_code, "grant_type": "urn:ietf:params:oauth:grant-type:device_code"},
-        headers={"Accept": "application/json"},
-    )
-    body = resp.json()
+    try:
+        resp = requests.post(
+            GITHUB_ACCESS_TOKEN_URL,
+            data={"client_id": CLIENT_ID, "device_code": device_code, "grant_type": "urn:ietf:params:oauth:grant-type:device_code"},
+            headers={"Accept": "application/json"},
+        )
+    except Exception as e:
+        return {"error": "network_error", "message": f"请求失败: {e}"}
+
+    if resp.status_code >= 500:
+        return {"error": "github_server_error", "message": f"GitHub 服务暂时不可用（{resp.status_code}），请稍后重试"}
+
+    try:
+        body = resp.json()
+    except Exception:
+        return {"error": "invalid_response", "message": f"GitHub 返回了非 JSON 响应（HTTP {resp.status_code}），请稍后重试"}
+
     error = body.get("error")
 
     if error == "authorization_pending":
